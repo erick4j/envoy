@@ -1850,6 +1850,11 @@ void ConnectionManagerImpl::ActiveStreamEncoderFilter::addEncodedData(Buffer::In
   return parent_.addEncodedData(*this, data, streaming);
 }
 
+void ConnectionManagerImpl::ActiveStreamEncoderFilter::encodeData(Buffer::Instance& data,
+                                                                  bool end_stream) {
+  parent_.encodeData(this, data, end_stream);
+}
+
 HeaderMap& ConnectionManagerImpl::ActiveStreamEncoderFilter::addEncodedTrailers() {
   return parent_.addEncodedTrailers();
 }

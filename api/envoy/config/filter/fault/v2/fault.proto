@@ -43,5 +43,24 @@ message FaultDelay {
   }
 
   // The percentage of operations/connection requests on which the delay will be injected.
-  envoy.type.FractionalPercent percentage = 4;
+  type.FractionalPercent percentage = 4;
+}
+
+// fixfix
+message FaultRateLimit {
+  // fixfix
+  message FixedLimit {
+    // fixfix
+    uint64 limit_kbps = 1 [(validate.rules).uint64.gte = 1];
+  }
+
+  oneof limit_type {
+    option (validate.required) = true;
+
+    // fixfix
+    FixedLimit fixed_limit = 1;
+  }
+
+  // fixfix
+  type.FractionalPercent percentage = 2;
 }

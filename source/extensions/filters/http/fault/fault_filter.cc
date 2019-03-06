@@ -27,7 +27,6 @@ namespace HttpFilters {
 namespace Fault {
 
 FaultSettings::FaultSettings(const envoy::config::filter::http::fault::v2::HTTPFault& fault) {
-
   if (fault.has_abort()) {
     const auto& abort = fault.abort();
     abort_percentage_ = abort.percentage();
@@ -53,13 +52,21 @@ FaultSettings::FaultSettings(const envoy::config::filter::http::fault::v2::HTTPF
   if (fault.has_max_active_faults()) {
     max_active_faults_ = fault.max_active_faults().value();
   }
+
+  if (fault.has_response_rate_limit()) {
+    RateLimit rate_limit;
+    ASSERT(fault.response_rate_limit().has_fixed_limit());
+    rate_limit.fixed_rate_kbps_ = fault.response_rate_limit().fixed_limit().limit_kbps();
+    rate_limit.percentage_ = fault.response_rate_limit().percentage();
+    response_rate_limit_ = rate_limit;
+  }
 }
 
 FaultFilterConfig::FaultFilterConfig(const envoy::config::filter::http::fault::v2::HTTPFault& fault,
                                      Runtime::Loader& runtime, const std::string& stats_prefix,
-                                     Stats::Scope& scope)
+                                     Stats::Scope& scope, TimeSource& time_source)
     : settings_(fault), runtime_(runtime), stats_(generateStats(stats_prefix, scope)),
-      stats_prefix_(stats_prefix), scope_(scope) {}
+      stats_prefix_(stats_prefix), scope_(scope), time_source_(time_source) {}
 
 FaultFilter::FaultFilter(FaultFilterConfigSharedPtr config) : config_(config) {}
 
@@ -75,9 +82,9 @@ Http::FilterHeadersStatus FaultFilter::decodeHeaders(Http::HeaderMap& headers, b
   // faults. In other words, runtime is supported only when faults are
   // configured at the filter level.
   fault_settings_ = config_->settings();
-  if (callbacks_->route() && callbacks_->route()->routeEntry()) {
+  if (decoder_callbacks_->route() && decoder_callbacks_->route()->routeEntry()) {
     const std::string& name = Extensions::HttpFilters::HttpFilterNames::get().Fault;
-    const auto* route_entry = callbacks_->route()->routeEntry();
+    const auto* route_entry = decoder_callbacks_->route()->routeEntry();
 
     const FaultSettings* tmp = route_entry->perFilterConfigTyped<FaultSettings>(name);
     const FaultSettings* per_route_settings =
@@ -115,12 +122,15 @@ Http::FilterHeadersStatus FaultFilter::decodeHeaders(Http::HeaderMap& headers, b
         fmt::format("fault.http.{}.abort.http_status", downstream_cluster_);
   }
 
+  maybeSetupResponseRateLimit();
+
   absl::optional<uint64_t> duration_ms = delayDuration();
   if (duration_ms) {
-    delay_timer_ = callbacks_->dispatcher().createTimer([this]() -> void { postDelayInjection(); });
+    delay_timer_ =
+        decoder_callbacks_->dispatcher().createTimer([this]() -> void { postDelayInjection(); });
     delay_timer_->enableTimer(std::chrono::milliseconds(duration_ms.value()));
     recordDelaysInjectedStats();
-    callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::DelayInjected);
+    decoder_callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::DelayInjected);
     return Http::FilterHeadersStatus::StopIteration;
   }
 
@@ -130,6 +140,37 @@ Http::FilterHeadersStatus FaultFilter::decodeHeaders(Http::HeaderMap& headers, b
   }
 
   return Http::FilterHeadersStatus::Continue;
+}
+
+void FaultFilter::maybeSetupResponseRateLimit() {
+  if (!fault_settings_->responseRateLimit().has_value()) {
+    return;
+  }
+
+  if (!config_->runtime().snapshot().featureEnabled(
+          RuntimeKeys::get().ResponseRateLimitKey,
+          fault_settings_->responseRateLimit().value().percentage_)) {
+    return;
+  }
+
+  // fixfix downstream key
+
+  incActiveFaults();
+  config_->stats().response_rl_injected_.inc();
+
+  response_limiter_.reset(
+      new StreamRateLimiter(fault_settings_->responseRateLimit().value().fixed_rate_kbps_,
+                            encoder_callbacks_->encoderBufferLimit(),
+                            [] {
+                              ASSERT(false); // fixfix
+                            },
+                            [] {
+                              ASSERT(false); // fixfix
+                            },
+                            [this](Buffer::Instance& data, bool end_stream) {
+                              encoder_callbacks_->encodeData(data, end_stream);
+                            },
+                            config_->timeSource(), decoder_callbacks_->dispatcher()));
 }
 
 bool FaultFilter::faultOverflow() {
@@ -274,14 +315,14 @@ void FaultFilter::postDelayInjection() {
     abortWithHTTPStatus();
   } else {
     // Continue request processing.
-    callbacks_->continueDecoding();
+    decoder_callbacks_->continueDecoding();
   }
 }
 
 void FaultFilter::abortWithHTTPStatus() {
-  callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::FaultInjected);
-  callbacks_->sendLocalReply(static_cast<Http::Code>(abortHttpStatus()), "fault filter abort",
-                             nullptr, absl::nullopt);
+  decoder_callbacks_->streamInfo().setResponseFlag(StreamInfo::ResponseFlag::FaultInjected);
+  decoder_callbacks_->sendLocalReply(static_cast<Http::Code>(abortHttpStatus()),
+                                     "fault filter abort", nullptr, absl::nullopt);
   recordAbortsInjectedStats();
 }
 
@@ -289,7 +330,7 @@ bool FaultFilter::matchesTargetUpstreamCluster() {
   bool matches = true;
 
   if (!fault_settings_->upstreamCluster().empty()) {
-    Router::RouteConstSharedPtr route = callbacks_->route();
+    Router::RouteConstSharedPtr route = decoder_callbacks_->route();
     matches = route && route->routeEntry() &&
               (route->routeEntry()->clusterName() == fault_settings_->upstreamCluster());
   }
@@ -318,8 +359,85 @@ void FaultFilter::resetTimerState() {
   }
 }
 
-void FaultFilter::setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) {
-  callbacks_ = &callbacks;
+Http::FilterDataStatus FaultFilter::encodeData(Buffer::Instance& data, bool end_stream) {
+  // fixfix deal with end stream, if end stream need to drain the buffer out.
+  if (response_limiter_ != nullptr) {
+    return response_limiter_->writeData(data, end_stream);
+  }
+
+  return Http::FilterDataStatus::Continue;
+}
+
+Http::FilterTrailersStatus FaultFilter::encodeTrailers(Http::HeaderMap&) {
+  ASSERT(false); // fixfix
+  return Http::FilterTrailersStatus::Continue;
+}
+
+StreamRateLimiter::StreamRateLimiter(uint64_t max_kbps, uint64_t max_buffered_data,
+                                     std::function<void()> pause_data_cb,
+                                     std::function<void()> resume_data_cb,
+                                     std::function<void(Buffer::Instance&, bool)> write_data_cb,
+                                     TimeSource& time_source, Event::Dispatcher& dispatcher)
+    : bytes_per_time_slice_((max_kbps * 1024) / 16), max_buffered_data_(max_buffered_data),
+      pause_data_cb_(pause_data_cb), resume_data_cb_(resume_data_cb), write_data_cb_(write_data_cb),
+      token_bucket_(16, time_source, 16),
+      token_timer_(dispatcher.createTimer([this] { onTokenTimer(); })) {
+  ASSERT(bytes_per_time_slice_ > 0);
+  ASSERT(max_buffered_data_ > 0);
+}
+
+void StreamRateLimiter::onTokenTimer() {
+  ASSERT(waiting_for_token_);
+  waiting_for_token_ = false;
+
+  ENVOY_LOG(trace, "limiter: timer wakeup: buffered={}", buffer_.length());
+  Buffer::OwnedImpl data_to_write;
+  writeDataHelper(data_to_write);
+  write_data_cb_(data_to_write, saw_end_stream_ && buffer_.length() == 0);
+}
+
+void StreamRateLimiter::writeDataHelper(Buffer::Instance& incoming_buffer) {
+  // fixfix
+  const uint64_t tokens_needed =
+      (buffer_.length() + bytes_per_time_slice_ - 1) / bytes_per_time_slice_;
+  const uint64_t tokens_obtained = token_bucket_.consume(tokens_needed, true);
+  const uint64_t bytes_to_write =
+      std::min(tokens_obtained * bytes_per_time_slice_, buffer_.length());
+  ENVOY_LOG(trace, "limiter: tokens_needed={} tokens_obtained={} to_write={}", tokens_needed,
+            tokens_obtained, bytes_to_write);
+
+  // fixfix
+  incoming_buffer.move(buffer_, bytes_to_write);
+
+  // fixfix
+  if (buffer_.length() > 0) {
+    const std::chrono::milliseconds ms = token_bucket_.nextTokenAvailable();
+    if (ms.count() > 0) {
+      ENVOY_LOG(trace, "limiter: scheduling wakeup for {}ms", ms.count());
+      token_timer_->enableTimer(ms);
+      waiting_for_token_ = true;
+    }
+  }
+}
+
+Http::FilterDataStatus StreamRateLimiter::writeData(Buffer::Instance& incoming_buffer,
+                                                    bool end_stream) {
+  ENVOY_LOG(trace, "limiter: incoming data length={} buffered={}", incoming_buffer.length(),
+            buffer_.length());
+  buffer_.move(incoming_buffer);
+  if (buffer_.length() > max_buffered_data_) {
+    ASSERT(false); // fixfix
+  }
+
+  saw_end_stream_ = end_stream;
+  if (waiting_for_token_) {
+    return Http::FilterDataStatus::StopIterationNoBuffer;
+  }
+
+  writeDataHelper(incoming_buffer);
+
+  return incoming_buffer.length() > 0 ? Http::FilterDataStatus::Continue
+                                      : Http::FilterDataStatus::StopIterationNoBuffer;
 }
 
 } // namespace Fault

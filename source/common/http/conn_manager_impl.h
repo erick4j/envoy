@@ -253,6 +253,7 @@ private:
 
     // Http::StreamEncoderFilterCallbacks
     void addEncodedData(Buffer::Instance& data, bool streaming) override;
+    void encodeData(Buffer::Instance& data, bool end_stream) override;
     HeaderMap& addEncodedTrailers() override;
     void onEncoderFilterAboveWriteBufferHighWatermark() override;
     void onEncoderFilterBelowWriteBufferLowWatermark() override;
